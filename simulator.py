@@ -116,13 +116,16 @@ class Simulator:
 
     def update_status(self):
         progress = np.linalg.norm(self.car.state[0:2] - self.rt.centerline[0, 0:2], 2)
+        # print("progress: ", progress)
 
         if progress > 10.0 and not self.lap_started:
             self.lap_started = True
     
-        if progress <= 1.0 and self.lap_started and not self.lap_finished:
+        if progress <= 10.0 and self.lap_started and not self.lap_finished:
             self.lap_finished = True
             self.lap_time_elapsed = time() - self.lap_start_time
+            print("lap time: ", self.lap_time_elapsed)
+            print("Violations: ", self.track_limit_violations)
 
         if not self.lap_finished and self.lap_start_time is not None:
             self.lap_time_elapsed = time() - self.lap_start_time

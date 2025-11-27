@@ -1,274 +1,167 @@
 import numpy as np
 from numpy.typing import ArrayLike
 
-from simulator import RaceTrack
+# ======================
+# Tuning knobs
+# ======================
 
+# P controlled gains for tuning knobs
+STEER_GAIN = 3.8         # P-gain for steering rate - how aggressively the car fixes steering errors
+ACCEL_GAIN = 4.2         # P-gain for longitudinal acceleration - how strongly the car tries to match desired speed
 
-# ================================================================
-# Helper utilities
-# ================================================================
+# determines how far ahead the steering controller aims
+# A small lookahead → tighter turns
+# A large lookahead → smoother high-speed behavior
+MIN_LOOKAHEAD = 3
+MAX_LOOKAHEAD = 20
+LOOKAHEAD_SCALING = 0.22
 
-def _wrap_angle(theta: float) -> float:
-    """Wrap angle to [-pi, pi]."""
+YAW_CORRECTION_TIME = 0.37     
+
+MAX_VEL = 100.0
+MIN_VEL = 5.0
+
+CURV_LOOKAHEAD_DIST = 140       
+CURV_STEP = 4                   
+MAX_LAT_ACC = 9.0               
+BRAKE_ACC = 7.2                 
+
+def wrap(theta: float) -> float:
+    """Normalize angle to [-pi, pi]. Used for heading error so the car doesn't wrap around incorrectly."""
     return np.arctan2(np.sin(theta), np.cos(theta))
 
 
-def _closest_centerline_index(position: ArrayLike, racetrack: RaceTrack) -> int:
-    """Return the index of the closest point on the track centerline."""
-    diffs = racetrack.centerline[:, :2] - position[:2]
-    dists_sq = np.einsum("ij,ij->i", diffs, diffs)
-    return int(np.argmin(dists_sq))
+def nearest_track_index(pos: np.ndarray, pts: np.ndarray) -> int:
+    """Return the index of the centerline point closest to the car position."""
+    car_xy = pos[:2]
+    track_xy = pts[:, :2]
+
+    diff = track_xy - car_xy
+    squared_distances = np.sum(diff ** 2, axis=1)
+    closest_index = int(np.argmin(squared_distances))
+
+    return closest_index
 
 
-def _compute_curvature(points: ArrayLike, idx: int) -> float:
-    """Compute local path curvature using Menger curvature."""
-    n = len(points)
-    idx_prev = (idx - 1) % n
-    idx_next = (idx + 1) % n
-    
-    p1 = points[idx_prev, :2]
-    p2 = points[idx, :2]
-    p3 = points[idx_next, :2]
-    
-    area = 0.5 * abs((p2[0] - p1[0]) * (p3[1] - p1[1]) -
-                     (p3[0] - p1[0]) * (p2[1] - p1[1]))
-    
-    a = np.linalg.norm(p2 - p1)
-    b = np.linalg.norm(p3 - p2)
-    c = np.linalg.norm(p3 - p1)
-    
-    if a < 1e-6 or b < 1e-6 or c < 1e-6:
-        return 0.0
-    
-    return 4.0 * area / (a * b * c)
+def sample_radius(p1, p2, p3):
+    """Estimate turn radius from three points."""
+    v1 = p2 - p1
+    v2 = p3 - p2
+    n1 = np.linalg.norm(v1)
+    n2 = np.linalg.norm(v2)
 
+    if n1 < 1e-3 or n2 < 1e-3:
+        return 1e5  # nearly straight
 
-# ================================================================
-# PID Controller
-# ================================================================
+    cos_ang = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
+    ang = np.arccos(cos_ang)
 
-class PIDController:
-    def __init__(self, kp, ki, kd, output_limits=None, windup_limit=10.0):
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-        self.output_limits = output_limits
-        self.windup_limit = windup_limit
-        
-        self.integral = 0.0
-        self.prev_error = 0.0
-        self.initialized = False
-    
-    def reset(self):
-        self.integral = 0.0
-        self.prev_error = 0.0
-        self.initialized = False
-    
-    def compute(self, error, dt=0.1):
-        p = self.kp * error
-        self.integral += error * dt
-        self.integral = np.clip(self.integral, -self.windup_limit, self.windup_limit)
-        i = self.ki * self.integral
-        
-        if not self.initialized:
-            d = 0.0
-            self.initialized = True
-        else:
-            d = self.kd * (error - self.prev_error) / dt
-        
-        self.prev_error = error
-        
-        out = p + i + d
-        if self.output_limits is not None:
-            out = np.clip(out, self.output_limits[0], self.output_limits[1])
-        return out
+    if ang < 0.03:
+        return 1e5
 
+    return n1 / ang
 
-_speed_controller = None
-_steering_controller = None
+# SPEED PLANNER (refactored)
 
+def target_speed(state: np.ndarray, track, params: np.ndarray) -> float:
+    """Computes the target speed based on approximate curvature ahead."""
 
-# ================================================================
-# Low-level controller
-# ================================================================
+    car_xy = state[:2] # extract the car's position from the state vector
+    cl = track.centerline[:, :2] # get the centerline points of the track
+    N = cl.shape[0]
 
-def lower_controller(state, desired, parameters):
-    """PID tracking of steering and speed."""
-    global _speed_controller, _steering_controller
-    
-    state = np.asarray(state, float)
-    desired = np.asarray(desired, float)
-    parameters = np.asarray(parameters, float)
+    idx0 = nearest_track_index(car_xy, cl) # find the closest point on the centerline to the car
 
-    delta = state[2]
-    v = state[3]
-    delta_ref, v_ref = desired
-    
-    delta_dot_min = parameters[7]
-    a_min = parameters[8]
-    delta_dot_max = parameters[9]
-    a_max = parameters[10]
+    safe_v = MAX_VEL
 
-    if _speed_controller is None:
-        _speed_controller = PIDController(
-            kp=2.0, ki=0.4, kd=0.1,
-            output_limits=(a_min, a_max),
-            windup_limit=20
-        )
-    if _steering_controller is None:
-        _steering_controller = PIDController(
-            kp=3.3, ki=0.0, kd=0.3,
-            output_limits=(delta_dot_min, delta_dot_max),
-            windup_limit=5
-        )
+    # Look ahead up to ~140 points to detect curves
+    for offset in range(0, CURV_LOOKAHEAD_DIST, CURV_STEP):
+        a = cl[(idx0 + offset) % N]
+        b = cl[(idx0 + offset + CURV_STEP) % N]
+        c = cl[(idx0 + offset + 2 * CURV_STEP) % N]
 
-    # Steering
-    delta_error = _wrap_angle(delta_ref - delta)
-    delta_dot = _steering_controller.compute(delta_error, 0.1)
+        R = sample_radius(a, b, c)
+        v_corner = np.sqrt(MAX_LAT_ACC * R)
 
-    # Speed
-    v_error = v_ref - v
-    v_dot = _speed_controller.compute(v_error, 0.1)
+        dist = np.linalg.norm(a - car_xy)
+        v_now = np.sqrt(max(0.0, v_corner**2 + 2 * BRAKE_ACC * dist)) # Compute braking safe speed at current position
 
-    delta_dot = np.clip(delta_dot, delta_dot_min, delta_dot_max)
-    v_dot = np.clip(v_dot, a_min, a_max)
-    return np.array([delta_dot, v_dot])
+        safe_v = min(safe_v, v_now) # take the lowest safe speed over the entire lookahead.
 
+    return float(np.clip(safe_v, MIN_VEL, MAX_VEL))
 
-# ================================================================
-# High-level controller
-# ================================================================
+# STEERING TARGET (refactored)
 
-def controller(state, parameters, racetrack: RaceTrack):
-    state = np.asarray(state, float)
-    parameters = np.asarray(parameters, float)
+def steering_target(state: np.ndarray, track, params: np.ndarray) -> float:
+    """Computes the desired steering angle that turns the car toward a forward point."""
 
-    x, y, delta, v, phi = state
-    
-    wheelbase = parameters[0]
-    delta_min = parameters[1]
-    v_min = parameters[2]
-    delta_max = parameters[4]
-    v_max = parameters[5]
+    car_xy = state[:2] 
+    heading = state[4] 
+    speed = max(state[3], 1.0) 
 
-    centerline = racetrack.centerline
-    n = centerline.shape[0]
-    position = state[:2]
+    cl = track.centerline[:, :2]
+    wb = params[0]
+    max_delta = params[4] 
 
-    # ------------------------------------------------------------
-    # 1. Closest point
-    # ------------------------------------------------------------
-    idx_closest = _closest_centerline_index(position, racetrack)
+    raw_LA = LOOKAHEAD_SCALING * speed
+    LA = int(np.clip(raw_LA, MIN_LOOKAHEAD, MAX_LOOKAHEAD))
 
-    # ------------------------------------------------------------
-    # 2. Short-range curvature (immediate)
-    # ------------------------------------------------------------
-    max_curv = 0.0
-    for i in range(8):
-        idx = (idx_closest + 2 * i) % n
-        max_curv = max(max_curv, _compute_curvature(centerline, idx))
+    idx0 = nearest_track_index(car_xy, cl)
+    aim_pt = cl[(idx0 + LA) % cl.shape[0]]
 
-    # ------------------------------------------------------------
-    # 3. Long-range curvature (anticipatory braking)
-    # ------------------------------------------------------------
-    long_range_curv = 0.0
-    for i in range(20):
-        idx = (idx_closest + 3 * i) % n
-        long_range_curv = max(long_range_curv, _compute_curvature(centerline, idx))
+    dx = aim_pt[0] - car_xy[0]
+    dy = aim_pt[1] - car_xy[1]
 
-    effective_curv = max(max_curv, long_range_curv)
+    desired_heading = np.arctan2(dy, dx)
+    heading_err = wrap(desired_heading - heading)
 
-    # Curvature thresholds
-    tight_thresh = 0.015
-    medium_thresh = 0.008
-    gentle_thresh = 0.004
+    desired_yaw_rate = heading_err / YAW_CORRECTION_TIME
 
-    # ------------------------------------------------------------
-    # 4. Adaptive lookahead (smaller in turns)
-    # ------------------------------------------------------------
-    if effective_curv > tight_thresh:
-        LA = 5
-    elif effective_curv > medium_thresh:
-        LA = 8
-    elif effective_curv > gentle_thresh:
-        LA = 12
-    else:
-        base_LA = 14
-        LA = int(base_LA * np.clip(v / v_max, 0.3, 1.0))
-        LA = int(np.clip(LA, 10, 25))
+    delta = np.arctan((wb * desired_yaw_rate) / speed)
 
-    idx_LA = (idx_closest + LA) % n
-    target = centerline[idx_LA, :2]
+    return float(np.clip(delta, -max_delta, max_delta))
 
-    # Transform to vehicle frame
-    dx = target[0] - x
-    dy = target[1] - y
-    cp, sp = np.cos(phi), np.sin(phi)
-    
-    x_local = cp * dx + sp * dy
-    y_local = -sp * dx + cp * dy
-    Ld = np.hypot(x_local, y_local)
+# HIGH-LEVEL CONTROLLER
 
-    # ------------------------------------------------------------
-    # 5. Pure Pursuit steering
-    # ------------------------------------------------------------
-    if Ld < 0.5:
-        delta_ref = delta
-    else:
-        alpha = np.arctan2(y_local, x_local)
-        curvature_cmd = 2 * np.sin(alpha) / max(Ld, 1e-6)
-        delta_ref = np.arctan(wheelbase * curvature_cmd)
-        delta_ref = np.clip(delta_ref, delta_min, delta_max)
+def controller(state: ArrayLike, params: ArrayLike, track) -> np.ndarray:
+    """
+    Outputs:
+        [desired steering angle, desired speed]
+    """
+    s = np.asarray(state, float)
+    p = np.asarray(params, float)
 
-    # ------------------------------------------------------------
-    # 6. Hard steering-based slowdown
-    # ------------------------------------------------------------
-    if abs(delta_ref) > 0.70 * delta_max:
-        v_max_turn = 0.12 * v_max
-    elif abs(delta_ref) > 0.85 * delta_max:
-        v_max_turn = 0.08 * v_max
-    else:
-        v_max_turn = v_max
+    desired_delta = steering_target(s, track, p)
+    desired_vel = target_speed(s, track, p)
 
-    # ------------------------------------------------------------
-    # 7. Conservative speed mapping (VERY SLOW in turns)
-    # ------------------------------------------------------------
-    straight_speed = 0.60 * v_max
-    gentle_speed   = 0.40 * v_max
-    medium_speed   = 0.25 * v_max
-    tight_speed    = 0.10 * v_max
+    return np.array([desired_delta, desired_vel], dtype=float)
 
-    if effective_curv > tight_thresh:
-        v_ref = tight_speed
-    elif effective_curv > medium_thresh:
-        v_ref = medium_speed
-    elif effective_curv > gentle_thresh:
-        v_ref = gentle_speed
-    else:
-        v_ref = straight_speed
+# LOW-LEVEL CONTROLLER
 
-    # Also enforce steering-limited max speed
-    v_ref = min(v_ref, v_max_turn)
+def lower_controller(state: ArrayLike, ref: ArrayLike, params: ArrayLike) -> np.ndarray:
+    """
+    Converts:
+        desired steering angle, desired speed
+    into:
+        steering_rate, acceleration
+    using simple but tuned P controllers.
+    """
 
-    # ------------------------------------------------------------
-    # 8. Heading alignment penalty
-    # ------------------------------------------------------------
-    ahead = centerline[(idx_closest + 2) % n, :2]
-    curr = centerline[idx_closest, :2]
-    
-    path_heading = np.arctan2(ahead[1] - curr[1], ahead[0] - curr[0])
-    heading_err = abs(_wrap_angle(path_heading - phi))
+    s = np.asarray(state, float)
+    r = np.asarray(ref, float)
 
-    if heading_err > np.radians(35):
-        v_ref *= 0.45
-    elif heading_err > np.radians(20):
-        v_ref *= 0.65
-    elif heading_err > np.radians(10):
-        v_ref *= 0.85
+    cur_delta = s[2]
+    cur_vel   = s[3]
 
-    # ------------------------------------------------------------
-    # 9. Ensure bounds
-    # ------------------------------------------------------------
-    v_ref = np.clip(v_ref, max(0.1, v_min), v_max)
+    delta_ref = r[0]
+    vel_ref   = r[1]
 
-    return np.array([delta_ref, v_ref], float)
+    # Steering rate cmd
+    steer_err = wrap(delta_ref - cur_delta)
+    steer_rate = STEER_GAIN * steer_err
+
+    # Acceleration cmd
+    vel_err = vel_ref - cur_vel
+    accel_cmd = ACCEL_GAIN * vel_err
+
+    return np.array([steer_rate, accel_cmd], dtype=float)
